@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Stand-in for TwitchDownloaderCLI used by the automated tests.
+
+It accepts the same arguments the real tool does for ``info``, ``chatdownload``
+and ``videodownload`` and prints progress in the same ``[STATUS] - …`` format,
+but produces synthetic chat and an FFmpeg test-pattern video instead of
+talking to Twitch. Special VOD ids trigger error paths:
+
+  404…  deleted / expired VOD          500…  network error (fails FAKE_NET_FAILS times)
+  777…  VOD without any chat           403…  subscriber-only VOD (video download)
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from highlight_finder import sample_data  # noqa: E402
+
+DURATION = float(os.environ.get("FAKE_DURATION", "3600"))
+
+
+def status(text, newline=True):
+    sys.stdout.write(("\r" if not newline else "") + "[STATUS] - " + text + ("\n" if newline else ""))
+    sys.stdout.flush()
+
+
+def seconds(value):
+    assert value.endswith("s") and value[:-1].isdigit(), f"unexpected time format: {value}"
+    return int(value[:-1])
+
+
+def fail(message, code=1):
+    sys.stderr.write(f"Unhandled exception. System.NullReferenceException: {message}\n   at TwitchDownloaderCore...\n")
+    sys.exit(code)
+
+
+def maybe_network_error(vod_id):
+    if not vod_id.startswith("500"):
+        return
+    counter = Path(os.environ.get("FAKE_STATE_DIR", ".")) / f"fails_{vod_id}"
+    done = int(counter.read_text()) if counter.exists() else 0
+    if done < int(os.environ.get("FAKE_NET_FAILS", "99")):
+        counter.write_text(str(done + 1))
+        sys.stderr.write("Unhandled exception. System.Net.Http.HttpRequestException: No such host is known. (gql.twitch.tv:443)\n")
+        sys.exit(134)
+
+
+def main():
+    if sys.argv[1:2] == ["--version"]:
+        print("TwitchDownloaderCLI 1.56.5")
+        return
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="mode", required=True)
+    for mode in ("info", "chatdownload", "videodownload"):
+        p = sub.add_parser(mode)
+        p.add_argument("-u", "--id", required=True)
+        p.add_argument("--banner")
+        p.add_argument("--log-level")
+        p.add_argument("--oauth")
+        if mode == "info":
+            p.add_argument("-f", "--format", default="Table")
+        else:
+            p.add_argument("-o", "--output", required=True)
+            p.add_argument("-b", "--beginning")
+            p.add_argument("-e", "--ending")
+            p.add_argument("-t", "--threads")
+            p.add_argument("--temp-path")
+            p.add_argument("--collision", required=True)   # default is an interactive prompt
+        if mode == "videodownload":
+            p.add_argument("-q", "--quality")
+            p.add_argument("--trim-mode")
+            p.add_argument("--ffmpeg-path")
+    args = parser.parse_args()
+    vod_id = args.id
+    assert vod_id.isdigit(), "tests always pass a numeric id"
+    maybe_network_error(vod_id)
+
+    if args.mode == "info":
+        assert args.format == "Raw"
+        if vod_id.startswith("404"):
+            print(json.dumps({"data": {"video": None}, "extensions": None}))
+            print("null")
+            return
+        video = {"title": f"Test stream {vod_id}", "thumbnailURLs": [], "createdAt": "2026-01-01T18:00:00Z",
+                 "lengthSeconds": int(DURATION), "owner": {"id": "1", "displayName": "TestStreamer", "login": "teststreamer"},
+                 "viewCount": 4321, "game": {"id": "9", "displayName": "Test Game", "boxArtURL": ""}, "description": None,
+                 "status": "RECORDED"}
+        print(json.dumps({"data": {"video": video}, "extensions": None}))
+        print(json.dumps({"data": {"video": {"id": vod_id, "moments": {"edges": [
+            {"node": {"id": "m1", "durationMilliseconds": int(DURATION * 1000), "positionMilliseconds": 0,
+                      "description": "Test Game"}}]}}}, "extensions": None}))
+        print('#EXTM3U\n#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="chunked",NAME="1080p60 (source)",AUTOSELECT=YES,DEFAULT=YES\n'
+              '#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080\nhttps://example.invalid/chunked/index.m3u8\n'
+              '#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="720p60",NAME="720p60",AUTOSELECT=YES,DEFAULT=YES\n'
+              '#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720\nhttps://example.invalid/720p60/index.m3u8')
+        return
+
+    out = Path(args.output)
+    if args.mode == "chatdownload":
+        if vod_id.startswith("404"):
+            fail("Invalid VOD, deleted/expired VOD possibly?", 134)
+        for pct in range(0, 101, 20):
+            status(f"Downloading {pct}%", newline=False)
+        print()
+        status("Writing Output File")
+        if vod_id.startswith("777"):
+            out.write_text(json.dumps({"FileInfo": {}, "streamer": {"name": "Quiet", "login": "quiet", "id": 1},
+                                       "video": {"title": "No chat", "id": vod_id, "start": 0, "end": 600, "length": 600},
+                                       "comments": [], "embeddedData": None}))
+        else:
+            sample_data.write_chat_json(out, duration=DURATION, vod_id=vod_id, title=f"Test stream {vod_id}",
+                                        streamer="TestStreamer", game="Test Game", seed=int(vod_id) % 1000)
+        return
+
+    # videodownload
+    if vod_id.startswith("403"):
+        fail("Insufficient access to VOD, OAuth may be required.", 134)
+    begin, end = seconds(args.beginning), seconds(args.ending)
+    assert out.suffix == ".mp4" and end > begin
+    status("Fetching Video Info [1/4]")
+    for pct in (0, 50, 100):
+        status(f"Downloading {pct}% [2/4]", newline=False)
+    print()
+    status("Verifying Parts 100% [3/4]", newline=False)
+    print()
+    status("Finalizing Video 0% [4/4]", newline=False)
+    subprocess.run(
+        [args.ffmpeg_path or "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"testsrc2=size=1280x720:rate=30:duration={end - begin}",
+         "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={end - begin}",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(out)],
+        check=True,
+    )
+    status("Finalizing Video 100% [4/4]", newline=False)
+    print()
+
+
+if __name__ == "__main__":
+    main()

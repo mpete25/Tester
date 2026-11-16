@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# Runtime data (chat cache, logs, downloaded tools, exported clips)
+data/
+clips/
+logs/
+bin/
+.DS_Store
